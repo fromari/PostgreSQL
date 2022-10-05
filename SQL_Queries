@@ -1,0 +1,87 @@
+/*
+Connect to the "world" database and write a query.
+
+Find out what 10 countries are closest to Argentina as per the following criterion:
+
+C = ABS((GNP% + APC%) - (GNP_Argentina% + APC_Argentina%) ) 
+GNP% - GNP of a country in percent out of to the biggest possible GNP in the world.
+APC% - APC of a country in percent out of to the biggest possible APC in the world.
+APC – SurfaceArea/Population. It is the area per one citizen.
+*/
+
+create table gnp_apc as
+select
+	name,
+	gnp,
+	gnp /(
+	select
+		max(gnp)
+	from
+		country)* 100 as gnp_percent,
+	surfacearea / population as apc,
+	surfacearea / population /(
+	select
+		max(surfacearea / population)
+	from
+		country
+	where
+		population > 0.0) * 100 as apc_percent
+from
+	country
+where
+	population > 0.0;
+
+
+select
+	name,
+	abs((apc_percent + gnp_percent) - ((select gnp_percent from gnp_apc where name = 'Argentina') + (select apc_percent from gnp_apc where name = 'Argentina'))) as C
+from
+	gnp_apc
+where name != 'Argentina'
+order by c asc 
+limit 10
+
+
+
+/* Find cities with high population (>=8m) which are not capitals. */
+
+select
+	ct.id,
+	ct.name,
+	ct.countrycode,
+	ct.district,
+	ct.population
+from
+	city as ct
+left join country as c on
+	c.capital = ct.id
+where
+	ct.population >= 8000000
+	and c.capital is null;
+  
+  
+  
+/* Find cities that have population greater than average city population in the same country. */
+
+select
+	c.name countryname,
+	ct.name cityname,
+	ct.population as city_population
+from
+	(
+	select
+		avg(population) as avg_population,
+		countrycode
+	from
+		city
+	group by
+		countrycode) as average
+join city as ct
+		using (countrycode)
+join country as c on
+	c.code = ct.countrycode
+where
+	ct.population > average.avg_population
+order by
+	c."name" ,
+	ct."name";
