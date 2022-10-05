@@ -1,0 +1,277 @@
+Task №1. Access settings
+
+grant select on all tables in schema public to planadmin;
+grant select, update, insert, delete on plan_data to planadmin;
+grant select, update, insert, delete on plan_status to planadmin;
+grant select, update, insert, delete on country_managers to planadmin;
+grant select on all tables in schema public to planmanager;
+grant select, update, insert, delete on plan_data to planmanager;
+grant select, update on plan_status to planmanager;
+grant select on country_managers to planmanager;
+grant select, update on v_plan_edit to planmanager;
+grant select on v_plan to planmanager;
+
+create user ivan with password 'sql1';
+create user sophie with password 'sql2';
+create user kirill with password 'sql3';
+
+grant planadmin to ivan;
+grant planmanager to sophie;
+grant planmanager to kirill;
+
+insert into country_managers (username, country)
+values ('sophie', 'US'),
+       ('sophie', 'CA'),
+       ('kirill', 'FR'),
+       ('kirill', 'GB'),
+       ('kirill', 'DE'),
+       ('kirill', 'AU');
+
+
+Task №2. product2 & country 2 materialized views
+
+create materialized view product2 as
+select
+	productcategory.productcategoryid as pcid,
+	product.productid,
+	productcategory.name as pcname,
+	product.name as pname
+from product
+join productsubcategory using (productsubcategoryid)
+join productcategory using (productcategoryid);
+
+create materialized view country2 as
+select distinct address.countryregioncode as countrycode
+from address join customeraddress using (addressid)
+where addresstype = 'Main Office';
+
+grant select on product2 to planadmin;
+
+grant select on product2 to planmanager;
+
+grant select on country2 to planadmin;
+
+grant select on country2 to planmanager;
+
+
+Task №3. Loading data into the company table
+
+insert into company (cname, countrycode, city)
+select customer.companyname, address.countryregioncode, address.city
+from customer 
+join customeraddress using (customerid)
+join address using (addressid)
+where addresstype = 'Main Office';
+
+
+Task №4. Company classification
+
+insert into company_abc (cid, salestotal, cls, year)
+select
+	cid,
+	salestotal,
+	case
+		when sum(salestotal) over (partition by year
+	order by
+		salestotal desc) <= 0.8 * sum(salestotal) over (partition by year) then 'A'
+		when sum(salestotal) over (partition by year
+	order by
+		salestotal desc) <= 0.95 * sum(salestotal) over (partition by year) then 'B'
+		else 'C'
+	end as cls,
+	year
+from 
+(
+select co.id as cid, sum(soh.subtotal) as salestotal, date_part('y', soh.orderdate) as year
+from company as co
+join customer cs on co.cname = cs.companyname
+join salesorderheader as soh using (customerid)
+where date_part('y', soh.orderdate) in ('2012', '2013')
+group by co.id, date_part('y', soh.orderdate)
+) as sel
+order by salestotal desc
+ 
+ 
+Task №5. Finding quarterly sales amount by company, and product category
+
+insert into company_sales (cid, salesamt, year, quarter_yr, qr, categoryid, ccls)
+select cid, sum(linetotal) as salesamt, year, quarter_yr, qr, categoryid, ccls
+from
+(select company.id as cid, s.linetotal, extract(year from s2.orderdate) as year,
+       extract(quarter from s2.orderdate) as quarter_yr, to_char(s2.orderdate, 'YYYY.Q') as qr,
+       product2.pcid as categoryid,
+       company_abc.cls as ccls
+from salesorderdetail s
+join salesorderheader s2 using (salesorderid)
+join customer using (customerid)
+join company on customer.companyname = company.cname
+join company_abc on company.id = company_abc.cid
+join product2 using (productid)
+where year in (2012, 2013)
+      and company_abc.year = extract(year from s2.orderdate)) as sel
+group by year, quarter_yr, qr, cid, categoryid, ccls
+order by salesamt desc
+
+
+Task №6. Initial data preparation
+
+import psycopg2
+
+def start_planning(year, quarter, user, pwd):
+    
+    conn = psycopg2.connect(database="2022_plans_Maria", user=user, password=pwd, host="127.0.0.1")
+    
+    cursor = conn.cursor()
+    
+    DelPlanData = """delete from plan_data where quarterid in ('%s.%s')"""
+    DelStatusData = """delete from plan_status where quarterid in ('%s.%s')"""
+    PlanStatRec = """insert into plan_status (quarterid, status, modifieddatetime, author, country)
+                 select %s.%s as quarterid, 'R' as status, now() as modifieddatetime, 
+                        %s as author, country2.countrycode as country from country2 order by country"""
+    PlanDataN = """insert into plan_data (versionid, country, quarterid, pcid, salesamt) 
+                 select 'N' as versionid,  sel2.countrycode as country,  %s.%s as quaterid, 
+                         sel2.pcid as pcid,  coalesce(avg(sel1.salesamt), 0) as salesamt 
+                 from (select co.countrycode, cs.qr, cs.categoryid as pcid, sum(cs.salesamt) as salesamt
+                     from company as co
+                     join company_sales as cs on co.id = cs.cid
+                     where cs.ccls in ('A', 'B') and cs.qr in ('%s.%s', '%s.%s')
+                     group by co.countrycode, cs.qr, cs.categoryid) as sel1
+                 right join 
+                     (select distinct p2.pcid, co2.countrycode
+                     from country2 as co2
+                     cross join product2 as p2) as sel2 using(countrycode)
+                 where sel1.pcid = sel2.pcid
+                 group by 2, 4
+                 order by country, pcid"""
+    PlanDataP = """insert into plan_data(versionid, country, quarterid, pcid, salesamt)
+                 select 'P' as versionid, country as country, quarterid as quarterid, pcid as pcid, salesamt as salesamt
+                 from plan_data where versionid = 'N' and quarterid = '%s.%s'"""
+    
+    cursor.execute(DelPlanData, (year, quarter))
+    cursor.execute(DelStatusData, (year, quarter))
+    cursor.execute(PlanStatRec, (year, quarter, user))
+    cursor.execute(PlanDataN, (year, quarter, year-1, quarter, year-2, quarter))
+    cursor.execute(PlanDataP, (year, quarter))
+    
+    conn.commit()
+    conn.close()
+
+
+Task №7. Changing plan data
+
+def set_lock(year, quarter, user, pwd):
+    
+    conn = psycopg2.connect(database="2022_plans_Maria", user=user, password=pwd, host="127.0.0.1")
+    
+    cursor = conn.cursor()
+    
+    setlock = """update plan_status
+               set status = 'L', modifieddatetime = now(), author = current_user
+               where quarterid = '%s.%s'
+                    and status = 'R'
+                    and country in (select country
+                                from country_managers
+                                where username = current_user)"""
+    
+    cursor.execute(setlock, (year, quarter))
+
+    conn.commit()
+    conn.close()
+
+
+def remove_lock(year, quarter, user, pwd):
+    
+    conn = psycopg2.connect(database="2022_plans_Maria", user=user, password=pwd, host="127.0.0.1")
+    
+    cursor = conn.cursor()
+    
+    remlock = """update plan_status
+               set status = 'R', modifieddatetime = now(), author = current_user
+               where quarterid = '%s.%s'
+                    and status = 'L'
+                    and country in (select country
+                                from country_managers
+                                where username = current_user)"""
+    
+    cursor.execute(remlock, (year, quarter))
+
+    conn.commit()
+    conn.close()
+
+ 
+Task №8. Plan data approval
+
+def accept_plan(year, quarter, user, pwd):
+    
+    conn = psycopg2.connect(database="2022_plans_Maria", user=user, password=pwd, host="127.0.0.1")
+    
+    cursor = conn.cursor()
+    
+    clearA = """delete from plan_data as pd
+    where pd.versionid = 'A' and pd.quarterid = '%s.%s'
+    and country in (select country from country_managers
+    where username = current_user)
+    and exists (select * from plan_status as ps
+    where ps.status = 'R'
+    and pd.quarterid = ps.quarterid
+    and pd.country = ps.country)
+    """
+    
+    fromPtoA = """insert into plan_data(versionid, country, quarterid, pcid, salesamt)
+    select
+        'A' as versionid,
+        pd.country as country,
+        pd.quarterid as quarterid,
+        pd.pcid as pcid,
+        pd.salesamt as salesamt
+    from plan_data as pd
+    where pd.versionid = 'P' 
+    and pd.quarterid = '%s.%s'                      
+    and country in (select country from country_managers
+    where username = current_user)
+    and exists (select * from plan_status as ps
+    where pd.quarterid = ps.quarterid 
+    and ps.status = 'R'
+    and ps.country = pd.country)"""
+    
+    fromRtoA = """update plan_status as ps 
+    set status = 'A', modifieddatetime = now(), author = current_user
+    where ps.status = 'R'
+    and ps.quarterid = '%s.%s' 
+    and country in (select country from country_managers
+    where username = current_user)"""
+    
+    cursor.execute(clearA, (year, quarter))
+    cursor.execute(fromPtoA, (year, quarter))
+    cursor.execute(fromRtoA, (year, quarter))
+    
+    conn.commit()
+    conn.close()
+
+
+Task №9. Data preparation for plan-fact analysis in Q1 2014
+
+I used the 2nd approach: “Calculate actual data using salesorderheader and ordersalesdetail tables without using company_sales.”
+create materialized view mv_plan_fact_2014_q1 as
+select v.quarterid as "Quarter",
+       v.country as "Country",
+       p2.pcname as "Category name",
+       case when fact is null then null else v.salesamt-lj.fact end as "Dev.",
+       case when fact is null then null else (v.salesamt-lj.fact)*100/v.salesamt end as "Dev., %"
+from v_plan as v   
+join (select distinct pcid, pcname from product2) as p2 using (pcid)
+left join (                
+select co.countrycode, sum(sod.linetotal) as fact, p2.pcid as catid, p2.pcname as catname
+from company as co
+         join customer as cs on co.cname = cs.companyname
+         join salesorderheader as soh using(customerid)
+         join salesorderdetail as sod using(salesorderid)
+         join product2 as p2 using(productid) 
+where
+          extract(year from soh.orderdate) = '2014'
+          and extract(quarter from soh.orderdate) = '1'
+          and co.id in (select co2.cid
+                          from company_abc as co2
+                 where co2.cls != 'C' and co2.year = '2013')
+group by 1, 3, 4
+) as lj on lj.catid=v.pcid and lj.countrycode=v.country
